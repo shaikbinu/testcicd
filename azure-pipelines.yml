@@ -1,0 +1,92 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  CPANEL_HOST: '86.96.200.149'
+  CPANEL_PATH: '/'
+  GIT_REPO: 'https://github.com/shaikbinu/testcicd.git'
+  SSH_USER: 'gitmspgulf'
+  SSH_HOST: '86.96.200.149'
+  REMOTE_PATH: '/home/gitmspgulf/public_html'
+  SQL_FILE: 'backup.sql'
+
+stages:
+  - stage: CheckoutCode
+    displayName: 'Checkout Code'
+    jobs:
+      - job: Checkout
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - script: |
+              echo "Code checked out"
+
+  - stage: UploadFiles
+    displayName: 'Upload Files (excluding wp-config.php)'
+    jobs:
+      - job: Upload
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: DownloadSecureFile@1
+            name: ftpcreds
+            inputs:
+              secureFile: 'ftp-credentials'  # Upload in Library > Secure Files
+
+          - script: |
+              echo "Uploading files via LFTP"
+              sudo apt-get update && sudo apt-get install -y lftp
+              chmod +x $(ftpcreds.secureFilePath)
+
+              source $(ftpcreds.secureFilePath)
+              lftp -c "
+                open -u $FTP_USER,$FTP_PASS $CPANEL_HOST
+                set ssl:verify-certificate no
+                mirror -R --only-newer --no-perms --verbose \
+                       --exclude-glob wp-config.php \
+                       ./ $CPANEL_PATH
+              "
+            env:
+              FTP_USER: $(ftp_user)
+              FTP_PASS: $(ftp_pass)
+
+  - stage: DeployDatabase
+    displayName: 'Deploy Database via SSH'
+    jobs:
+      - job: DeployDB
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: InstallSSHKey@0
+            inputs:
+              sshPublicKey: '$(sshPublicKey)' # Define in Library > Variable Group or Pipeline Variables
+              sshKeySecureFile: 'id_rsa'      # Upload your private key (Secure File)
+
+          - script: |
+              echo "Updating SQL file to use 'IF NOT EXISTS' and 'REPLACE INTO'"
+              sed -i 's/CREATE TABLE /CREATE TABLE IF NOT EXISTS /g' "$SQL_FILE"
+              sed -i 's/INSERT INTO/REPLACE INTO/g' "$SQL_FILE"
+
+              echo "Uploading SQL file to remote server..."
+              scp -o StrictHostKeyChecking=no "$SQL_FILE" "$SSH_USER@$SSH_HOST:$REMOTE_PATH/$SQL_FILE"
+
+              echo "Running remote WP-CLI commands..."
+              ssh -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" bash <<EOF
+                set -e
+                cd "$REMOTE_PATH"
+
+                echo "Backing up existing DB..."
+                wp db export live-backup-before-import.sql
+
+                echo "Importing DB..."
+                wp db import "$SQL_FILE"
+
+                echo "Flushing cache..."
+                wp cache flush
+
+                echo "✅ DB deployment successful"
+EOF
+            displayName: 'Deploy SQL over SSH'
